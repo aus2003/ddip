@@ -156,7 +156,7 @@ DESIGN CHOICES
     a quality-of-life change that future-proofs the fetcher as Kalshi
     adds new market types.
 
-14. Minimum entry price filter (--min-price, default 0.0)
+14. Minimum entry price filter (--min-price, default 0.15)
     Initial backtest (96 trades, no price filter) showed that the
     38 trades with entry price below 0.15 had a negative Sharpe
     (-0.34, ns). The economic reason: a BUY NO on a market already
@@ -248,7 +248,7 @@ Flags:
     --min-volume  Minimum market volume (default: 50)
     --max-weight  Maximum raw position size before normalization (default: 0.25)
     --min-r2      Minimum R² to trust the signal (default: 0.10)
-    --min-price   Skip trades where entry price < this threshold (default: 0.0)
+    --min-price   Skip trades where entry price < this threshold (default: 0.15)
     --top-n       Positions to display (default: 20)
     --fetch-days  Days of history to fetch per market in backtest (default: 180)
     --limit       Max markets to process, ranked by volume (default: 200)
@@ -659,8 +659,10 @@ def simulate_market(
       3. Record P&L over the next hold_period days
 
     P&L per unit of bankroll:
-        raw_pnl  = w · (exit_price − entry_price)
-        net_pnl  = raw_pnl − spread_cost
+        raw_pnl     = w · (exit_price − entry_price)
+        spread_cost = |w| · spread · entry / 2
+        kalshi_fee  = 0.07 · |w| · entry          (derived from 0.07·C·P·(1−P) for BUY NO)
+        net_pnl     = raw_pnl − spread_cost − kalshi_fee
     """
     trades = []
     n = len(prices)
@@ -683,30 +685,27 @@ def simulate_market(
         # P&L = w · ΔP  (positive when price moves in forecasted direction)
         raw_pnl     = w * (exit_ - entry)
         spread_cost = abs(w) * sprd * entry / 2   # half-spread paid at entry
-
-        # Kalshi fee: 0.07 × C × P × (1-P)
-        # For BUY NO: C = |w| / (1-entry),  P = entry (YES price)
-        # Substituting: 0.07 × [|w|/(1-entry)] × entry × (1-entry) = 0.07 × |w| × entry
+        # Kalshi fee: 0.07 × C × P × (1-P). For BUY NO, C = |w|/(1-P), so fee = 0.07 × |w| × P
         kalshi_fee  = 0.07 * abs(w) * entry
-
         net_pnl     = raw_pnl - spread_cost - kalshi_fee
 
         trades.append({
-            "Ticker":     ticker,
-            "Title":      title[:45],
-            "Day":        t,
-            "Entry P":    round(entry, 4),
-            "Exit P":     round(exit_, 4),
-            "Weight":     round(w, 4),
-            "Action":     "BUY YES" if w > 0 else "BUY NO",
-            "mu_hat":     round(est["mu_hat"], 4),
-            "RV":         round(est["rv"], 4),
-            "R2":         round(est["r2"], 3),
-            "Raw PnL":    round(raw_pnl, 6),
-            "Net PnL":    round(net_pnl, 6),
-            "Spread":     round(sprd, 4),
-            "Kalshi Fee": round(kalshi_fee, 6),
-            "Win":        net_pnl > 0,
+            "Ticker":      ticker,
+            "Title":       title[:45],
+            "Day":         t,
+            "Entry P":     round(entry, 4),
+            "Exit P":      round(exit_, 4),
+            "Weight":      round(w, 4),
+            "Action":      "BUY YES" if w > 0 else "BUY NO",
+            "mu_hat":      round(est["mu_hat"], 4),
+            "RV":          round(est["rv"], 4),
+            "R2":          round(est["r2"], 3),
+            "Raw PnL":     round(raw_pnl, 6),
+            "Spread Cost": round(spread_cost, 6),
+            "Kalshi Fee":  round(kalshi_fee, 6),
+            "Net PnL":     round(net_pnl, 6),
+            "Spread":      round(sprd, 4),
+            "Win":         net_pnl > 0,
         })
 
     return trades
@@ -715,11 +714,11 @@ def simulate_market(
 def run_backtest(
     gamma:       float = GAMMA,
     lookback:    int   = LOOKBACK,
-    hold_period: int   = 1,
+    hold_period: int   = 7,
     min_volume:  float = 50,
     max_weight:  float = MAX_WEIGHT,
     min_r2:      float = MIN_R2,
-    min_price:   float = 0.0,
+    min_price:   float = 0.15,
     fetch_days:  int   = 90,
     limit:       int   = 50,
 ) -> pd.DataFrame:
@@ -827,7 +826,7 @@ def print_backtest_report(df: pd.DataFrame, hold_period: int, top_n: int) -> Non
     print(f"  Hold period              : {hold_period} day(s)")
     print(f"  Win rate                 : {win_rate:.1f}%  ({df['Win'].sum()}/{n_trades})")
     print(f"  Mean raw P&L / trade     : {mean_raw:+.6f}")
-    print(f"  Mean net P&L / trade     : {mean_net:+.6f}  (after spread cost)")
+    print(f"  Mean net P&L / trade     : {mean_net:+.6f}  (after spread + Kalshi fee)")
     print(f"  Profit factor            : {profit_factor:.2f}x")
     print(f"  Max drawdown (cumul.)    : {max_dd:+.6f}")
     print(f"  Annualized Sharpe (raw)  : {sr_color}{sharpe_raw:+.3f}{Style.RESET_ALL}")
@@ -853,21 +852,20 @@ def print_backtest_report(df: pd.DataFrame, hold_period: int, top_n: int) -> Non
                 "*"   if p_val_mean < 0.10 else "ns")
     pct_net = (mean_net / mean_raw * 100) if abs(mean_raw) > 1e-8 else float("nan")
 
+    mean_spread_cost = df["Spread Cost"].mean()
+    mean_kalshi_fee  = df["Kalshi Fee"].mean()
+    total_cost       = mean_spread_cost + mean_kalshi_fee
+
     print(f"\n{Fore.CYAN}{'━'*68}")
     print(f"  EMPIRICAL RESULTS")
     print(f"{'━'*68}{Style.RESET_ALL}")
     print(f"  t-stat (H₀: μ_net=0)      : {t_stat_mean:+.3f}  (p={p_val_mean:.4f} {sig_mean})")
     print(f"  95% CI for mean net PnL   : [{ci_lo:+.6f},  {ci_hi:+.6f}]")
     print(f"  Bootstrap 95% CI Sharpe   : [{sh_lo:+.3f},  {sh_hi:+.3f}]  (2,000 resamples)")
-    mean_fee    = df["Kalshi Fee"].mean()
-    mean_spread = df["Net PnL"].add(df["Kalshi Fee"]).rsub(mean_raw).mean()  # raw - fee_adj - net ≈ spread
-    mean_spread = (raw - net - df["Kalshi Fee"]).mean()
-
-    print(f"  Spread drag               : {mean_spread:+.6f} per trade")
-    print(f"  Kalshi fee drag           : {mean_fee:+.6f} per trade  "
-          f"(0.07 × |w| × entry)")
-    print(f"  Total cost drag           : {mean_raw - mean_net:+.6f} per trade  "
-          f"({100 - pct_net:.1f}% of gross PnL)")
+    print(f"  Spread drag               : {mean_spread_cost:+.6f} per trade")
+    print(f"  Kalshi fee drag           : {mean_kalshi_fee:+.6f} per trade")
+    print(f"  Total cost drag           : {total_cost:+.6f} per trade  "
+          f"({100 - pct_net:.1f}% of gross PnL consumed by transaction costs)")
 
     # ── Vol timing check (Lecture 5.7): does high RV → lower realized P&L? ──
     n_q = min(5, n_trades)
@@ -972,8 +970,8 @@ def print_backtest_report(df: pd.DataFrame, hold_period: int, top_n: int) -> Non
         print(f"  {r2_thresh:>7.2f}  {n_s:>6}  {win_s:>5.1f}%  "
               f"{c}{mn_s:>+11.6f}{Style.RESET_ALL}  {sr_s:>+7.3f}  {p_s:.4f} {sig}")
 
-    print(f"\n  Gross vs. net PnL (spread-cost sensitivity)")
-    for label, series in [("Gross — no spread cost", raw), ("Net   — with spread cost", net)]:
+    print(f"\n  Gross vs. net PnL (transaction-cost sensitivity)")
+    for label, series in [("Gross — no costs        ", raw), ("Net   — spread+Kalshi fee", net)]:
         n_s  = len(series)
         mn_s = series.mean()
         sd_s = series.std(ddof=1)
@@ -1019,6 +1017,7 @@ def print_backtest_report(df: pd.DataFrame, hold_period: int, top_n: int) -> Non
 
     print(f"\n{Fore.YELLOW}⚠  Survivorship bias: only currently-open markets are tested.")
     print(f"   Spread cost = half-spread × |w| × entry price, deducted at entry.")
+    print(f"   Kalshi fee  = 0.07 × |w| × entry price  (from 0.07×C×P×(1−P) for BUY NO).")
     print(f"   Annualized Sharpe assumes {int(252/hold_period)} non-overlapping periods/year.")
     print(f"   Not financial advice.{Style.RESET_ALL}\n")
 
@@ -1047,8 +1046,8 @@ def main():
                    help="Max markets to process, ranked by volume (default 50)")
     p.add_argument("--top-n",      type=int,   default=20,
                    help="Positions to display (default 20)")
-    p.add_argument("--min-price",  type=float, default=0.0,
-                   help="Skip trades where entry price (YES prob) is below this (default 0.0)")
+    p.add_argument("--min-price",  type=float, default=0.15,
+                   help="Skip trades where entry price (YES prob) is below this (default 0.15)")
     p.add_argument("--export",     metavar="FILE.csv",
                    help="Save full results to CSV")
     p.add_argument("--backtest",   action="store_true",
