@@ -683,23 +683,30 @@ def simulate_market(
         # P&L = w · ΔP  (positive when price moves in forecasted direction)
         raw_pnl     = w * (exit_ - entry)
         spread_cost = abs(w) * sprd * entry / 2   # half-spread paid at entry
-        net_pnl     = raw_pnl - spread_cost
+
+        # Kalshi fee: 0.07 × C × P × (1-P)
+        # For BUY NO: C = |w| / (1-entry),  P = entry (YES price)
+        # Substituting: 0.07 × [|w|/(1-entry)] × entry × (1-entry) = 0.07 × |w| × entry
+        kalshi_fee  = 0.07 * abs(w) * entry
+
+        net_pnl     = raw_pnl - spread_cost - kalshi_fee
 
         trades.append({
-            "Ticker":    ticker,
-            "Title":     title[:45],
-            "Day":       t,
-            "Entry P":   round(entry, 4),
-            "Exit P":    round(exit_, 4),
-            "Weight":    round(w, 4),
-            "Action":    "BUY YES" if w > 0 else "BUY NO",
-            "mu_hat":    round(est["mu_hat"], 4),
-            "RV":        round(est["rv"], 4),
-            "R2":        round(est["r2"], 3),
-            "Raw PnL":   round(raw_pnl, 6),
-            "Net PnL":   round(net_pnl, 6),
-            "Spread":    round(sprd, 4),
-            "Win":       net_pnl > 0,
+            "Ticker":     ticker,
+            "Title":      title[:45],
+            "Day":        t,
+            "Entry P":    round(entry, 4),
+            "Exit P":     round(exit_, 4),
+            "Weight":     round(w, 4),
+            "Action":     "BUY YES" if w > 0 else "BUY NO",
+            "mu_hat":     round(est["mu_hat"], 4),
+            "RV":         round(est["rv"], 4),
+            "R2":         round(est["r2"], 3),
+            "Raw PnL":    round(raw_pnl, 6),
+            "Net PnL":    round(net_pnl, 6),
+            "Spread":     round(sprd, 4),
+            "Kalshi Fee": round(kalshi_fee, 6),
+            "Win":        net_pnl > 0,
         })
 
     return trades
@@ -852,8 +859,15 @@ def print_backtest_report(df: pd.DataFrame, hold_period: int, top_n: int) -> Non
     print(f"  t-stat (H₀: μ_net=0)      : {t_stat_mean:+.3f}  (p={p_val_mean:.4f} {sig_mean})")
     print(f"  95% CI for mean net PnL   : [{ci_lo:+.6f},  {ci_hi:+.6f}]")
     print(f"  Bootstrap 95% CI Sharpe   : [{sh_lo:+.3f},  {sh_hi:+.3f}]  (2,000 resamples)")
-    print(f"  Spread drag               : {mean_raw - mean_net:+.6f} per trade  "
-          f"({100 - pct_net:.1f}% of gross PnL consumed by transaction costs)")
+    mean_fee    = df["Kalshi Fee"].mean()
+    mean_spread = df["Net PnL"].add(df["Kalshi Fee"]).rsub(mean_raw).mean()  # raw - fee_adj - net ≈ spread
+    mean_spread = (raw - net - df["Kalshi Fee"]).mean()
+
+    print(f"  Spread drag               : {mean_spread:+.6f} per trade")
+    print(f"  Kalshi fee drag           : {mean_fee:+.6f} per trade  "
+          f"(0.07 × |w| × entry)")
+    print(f"  Total cost drag           : {mean_raw - mean_net:+.6f} per trade  "
+          f"({100 - pct_net:.1f}% of gross PnL)")
 
     # ── Vol timing check (Lecture 5.7): does high RV → lower realized P&L? ──
     n_q = min(5, n_trades)
