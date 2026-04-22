@@ -1,5 +1,5 @@
 """
-Foundation Strategy — Kalshi Prediction Markets (MEAN REVERSION V6 - 1-DAY HOLD)
+Foundation Strategy — Kalshi Prediction Markets (MEAN REVERSION - DYNAMIC HOLD)
 ================================================
 Applies two techniques from finance lecture notes to prediction markets:
 1. Return Predictability (Lecture 5.6):
@@ -10,16 +10,10 @@ Applies two techniques from finance lecture notes to prediction markets:
    Scale positions by inverse realized variance (1/RV). 
 Combined mean-variance optimal weight:
     w = μ̂ / (γ · RV)
-DESIGN CHOICES
-==============
-1-12. [Mean-Reversion and All-Markets logic applied]
-13. 1-Day Hold / Mean Reversion Only (MERGED)
-    This version strictly trades negative momentum/mean-reversion signals (μ̂ < 0). 
-    Positive signals are discarded. When a valid signal fires, the backtester enters 
-    a BUY NO position on day `t` and closes it exactly one day later on day `t+1`.
+
 Usage:
     python model.py                                # live screener 
-    python model.py --backtest                     # backtest (1-Day Hold)
+    python model.py --backtest --hold 7            # backtest 7-day hold
     python model.py --backtest --min-price 0.15    # filter low-price trades
 """
 import argparse
@@ -51,6 +45,10 @@ MIN_R2      = 0.10
 MAX_WEIGHT  = 0.25  
 MIN_HISTORY = 10    
 MAX_SPREAD  = 0.10  
+
+SPORTS_KEYWORDS = ["nba", "nfl", "nhl", "mlb", "nascar", "pga", "premier",
+                   "champions", "bundesliga", "laliga", "seriea", "ligue1",
+                   "mvp", "championship", "playoff", "superbowl", "worldseries"]
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 def kalshi_get(path: str, params: dict = {}) -> dict:
@@ -160,7 +158,7 @@ def estimate(prices: list[float]) -> Optional[dict]:
     if rv < 1e-8:
         return None
     return {
-        "mu_hat": -slope * 252,  # Negative momentum / Fading the trend
+        "mu_hat": -slope * 252,  # Mean Reversion (fade the trend)
         "rv":     rv,            
         "r2":     r2,
         "n":      n,
@@ -180,7 +178,7 @@ def run(
     limit:      int   = 50,
 ) -> pd.DataFrame:
     print(f"\n{Fore.CYAN}{'─'*68}")
-    print(f"  Foundation Strategy  —  MEAN REVERSION (1-Day Hold, BUY NO Only)")
+    print(f"  Foundation Strategy  —  MEAN REVERSION (BUY NO Only)")
     print(f"  {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}")
     print(f"  γ={gamma}  lookback={lookback}d  min-vol={min_volume}  "
           f"max-weight={max_weight:.0%}  min-R²={min_r2}  limit={limit}")
@@ -188,9 +186,13 @@ def run(
     events  = fetch_events()
     markets = extract_markets(events)
     markets = [m for m in markets if float(m.get("volume_fp") or 0) >= min_volume]
+    markets = [m for m in markets if not any(
+        kw in (m.get("ticker") or "").lower() or kw in (m.get("title") or "").lower()
+        for kw in SPORTS_KEYWORDS
+    )]
     markets.sort(key=lambda m: float(m.get("volume_fp") or 0), reverse=True)
     markets = markets[:limit]
-    print(f"  Markets after volume filter + limit: {len(markets)}\n")
+    print(f"  Markets after volume + sports filter + limit: {len(markets)}\n")
     if not markets:
         print(f"{Fore.RED}No markets. Try --min-volume 0.{Style.RESET_ALL}")
         sys.exit(0)
@@ -279,6 +281,7 @@ def simulate_market(
     prices:      list[float],
     sprd:        float,
     lookback:    int,
+    hold_period: int,
     gamma:       float,
     max_weight:  float,
     min_r2:      float,
@@ -286,13 +289,15 @@ def simulate_market(
 ) -> list[dict]:
     trades = []
     n = len(prices)
-    if n <= lookback:
+    if n <= lookback + hold_period:
         return trades
-    for t in range(lookback, n - 1):
+        
+    for t in range(lookback, n - hold_period):
         hist = prices[t - lookback : t]
         est  = estimate(hist)
         if est is None or est["r2"] < min_r2:
             continue
+            
         w = mv_weight(est["mu_hat"], est["rv"], gamma, max_weight)
         
         # Mean Reversion logic: Ignore positive signals
@@ -303,10 +308,10 @@ def simulate_market(
         if entry < min_price:
             continue
             
-        exit_ = prices[t + 1]
-        hold_days = 1
-        raw_pnl     = w * (exit_ - entry)
+        # FIX: Dynamically jump forward by hold_period
+        exit_ = prices[t + hold_period]
         
+        raw_pnl     = w * (exit_ - entry)
         spread_cost = (abs(w) * sprd * entry / 2) + (abs(w) * sprd * exit_ / 2)
         kalshi_fee  = 0.07 * abs(w) * entry 
         
@@ -319,7 +324,7 @@ def simulate_market(
             "Day":         t,
             "Entry P":     round(entry, 4),
             "Exit P":      round(exit_, 4),
-            "Hold Days":   hold_days,
+            "Hold Days":   hold_period,
             "Weight":      round(w, 4),
             "Action":      "BUY NO", 
             "mu_hat":      round(est["mu_hat"], 4),
@@ -340,6 +345,7 @@ def simulate_market(
 def run_backtest(
     gamma:       float = GAMMA,
     lookback:    int   = LOOKBACK,
+    hold_period: int   = 7,
     min_volume:  float = 50,
     max_weight:  float = MAX_WEIGHT,
     min_r2:      float = MIN_R2,
@@ -348,17 +354,21 @@ def run_backtest(
     limit:       int   = 50,
 ) -> pd.DataFrame:
     print(f"\n{Fore.CYAN}{'─'*68}")
-    print(f"  Foundation Strategy — Walk-Forward Backtest (1-Day Hold)")
+    print(f"  Foundation Strategy — Walk-Forward Backtest ({hold_period}-Day Hold)")
     print(f"  {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}")
-    print(f"  γ={gamma}  lookback={lookback}d  fetch={fetch_days}d  "
+    print(f"  γ={gamma}  lookback={lookback}d  hold={hold_period}d fetch={fetch_days}d  "
           f"min-R²={min_r2}  min-price={min_price}  limit={limit}")
     print(f"{'─'*68}{Style.RESET_ALL}\n")
     events  = fetch_events()
     markets = extract_markets(events)
     markets = [m for m in markets if float(m.get("volume_fp") or 0) >= min_volume]
+    markets = [m for m in markets if not any(
+        kw in (m.get("ticker") or "").lower() or kw in (m.get("title") or "").lower()
+        for kw in SPORTS_KEYWORDS
+    )]
     markets.sort(key=lambda m: float(m.get("volume_fp") or 0), reverse=True)
     markets = markets[:limit]
-    print(f"  Markets after volume filter + limit: {len(markets)}\n")
+    print(f"  Markets after volume + sports filter + limit: {len(markets)}\n")
     print(f"  Fetching {fetch_days}-day history and simulating…\n")
     all_trades = []
     total      = len(markets)
@@ -376,8 +386,8 @@ def run_backtest(
         time.sleep(0.15)
         trades = simulate_market(
             ticker=ticker, title=title, prices=prices, sprd=sprd,
-            lookback=lookback, gamma=gamma, max_weight=max_weight, 
-            min_r2=min_r2, min_price=min_price,
+            lookback=lookback, hold_period=hold_period, gamma=gamma, 
+            max_weight=max_weight, min_r2=min_r2, min_price=min_price,
         )
         all_trades.extend(trades)
     print(f"\n  Simulation complete — {len(all_trades)} trades.\n")
@@ -519,7 +529,7 @@ def print_backtest_report(df: pd.DataFrame, top_n: int, plot: bool = False) -> N
                    headers=["Ticker","Title","Trades","Win(Net)%","Mean Net","Total Net"],
                    tablefmt="rounded_outline"))
                    
-    print(f"\n{Fore.YELLOW}⚠  1-Day Hold Logic: Trades enter on signal day and strictly exit the following day.")
+    print(f"\n{Fore.YELLOW}⚠  Dynamic Hold Logic: Trades exit {avg_hold_days:.0f} day(s) after signal.")
     print(f"   Spread cost = half-spread paid on entry AND half-spread paid on exit.")
     print(f"   Kalshi fee  = 0.07 × |w| × P for NO, paid once.")
     print(f"   Not financial advice.{Style.RESET_ALL}\n")
@@ -531,10 +541,11 @@ def main():
     p = argparse.ArgumentParser(description="Foundation Strategy")
     p.add_argument("--gamma",      type=float, default=GAMMA)
     p.add_argument("--lookback",   type=int,   default=LOOKBACK)
+    p.add_argument("--hold",       type=int,   default=7)  # Fixed: CLI argument restored
     p.add_argument("--min-volume", type=float, default=50)
     p.add_argument("--max-weight", type=float, default=MAX_WEIGHT)
     p.add_argument("--min-r2",     type=float, default=MIN_R2)
-    p.add_argument("--fetch-days", type=int,   default=365)
+    p.add_argument("--fetch-days", type=int,   default=180)
     p.add_argument("--limit",      type=int,   default=200)
     p.add_argument("--top-n",      type=int,   default=20)
     p.add_argument("--min-price",  type=float, default=0.15)
@@ -545,8 +556,9 @@ def main():
     
     if args.backtest:
         df = run_backtest(
-            gamma=args.gamma, lookback=args.lookback, min_volume=args.min_volume,
-            max_weight=args.max_weight, min_r2=args.min_r2, min_price=args.min_price,
+            gamma=args.gamma, lookback=args.lookback, hold_period=args.hold,
+            min_volume=args.min_volume, max_weight=args.max_weight, 
+            min_r2=args.min_r2, min_price=args.min_price,
             fetch_days=args.fetch_days, limit=args.limit,
         )
         print_backtest_report(df, top_n=args.top_n, plot=args.plot)
