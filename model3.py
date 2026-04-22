@@ -818,7 +818,7 @@ def main():
     p.add_argument("--min-volume", type=float, default=50)
     p.add_argument("--max-weight", type=float, default=MAX_WEIGHT)
     p.add_argument("--min-r2",     type=float, default=MIN_R2)
-    p.add_argument("--fetch-days", type=int,   default=180)
+    p.add_argument("--fetch-days", type=int,   default=365)
     p.add_argument("--limit",      type=int,   default=200)
     p.add_argument("--top-n",      type=int,   default=20)
     p.add_argument("--min-price",  type=float, default=0.15)
